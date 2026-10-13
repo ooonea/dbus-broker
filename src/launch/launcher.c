@@ -539,7 +539,7 @@ static int launcher_on_message(sd_bus_message *m, void *userdata, sd_bus_error *
         return error_trace(r);
 }
 
-static int launcher_ini_reader_parse_file(Launcher *launcher, CIniGroup **groupp, const char *path) {
+static int launcher_ini_reader_parse_file(Launcher *launcher, CIniGroup **groupp, const char *path, const char *canonical_path) {
         _c_cleanup_(c_closep) int fd = -1;
         _c_cleanup_(c_ini_reader_freep) CIniReader *reader = NULL;
         _c_cleanup_(c_ini_domain_unrefp) CIniDomain *domain = NULL;
@@ -547,7 +547,7 @@ static int launcher_ini_reader_parse_file(Launcher *launcher, CIniGroup **groupp
         ssize_t len;
         int r;
 
-        fd = open(path, O_RDONLY | O_CLOEXEC);
+        fd = open(canonical_path ?: path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
                 /*
                  * For compatibility reasons we have to accept any failure
@@ -622,16 +622,37 @@ static int launcher_ini_reader_parse_file(Launcher *launcher, CIniGroup **groupp
 
 static int launcher_load_service_file(Launcher *launcher, const char *path, const char *basename, size_t n_basename, NSSCache *nss_cache) {
         _c_cleanup_(c_ini_group_unrefp) CIniGroup *group = NULL;
+        _c_cleanup_(c_freep) char *canonical_path = NULL;
+        _c_cleanup_(c_freep) char *filename = NULL;
         _c_cleanup_(c_freep) char **argv = NULL;
         _c_cleanup_(service_freep) Service *service = NULL;
         CIniEntry *name_entry = NULL, *unit_entry = NULL, *exec_entry = NULL, *user_entry = NULL;
         const char *name = NULL, *unit = NULL, *exec = NULL, *user = NULL;
         size_t argc = 0, n_exec, n_name;
         CRBNode **slot, *parent;
+        Service *seen;
         uid_t uid;
         int r;
 
-        r = launcher_ini_reader_parse_file(launcher, &group, path);
+        canonical_path = realpath(path, NULL);
+        if (!canonical_path && errno == ENOMEM)
+                return error_origin(-ENOMEM);
+
+        if (canonical_path) {
+                filename = strndup(basename, n_basename);
+                if (!filename)
+                        return error_origin(-ENOMEM);
+                seen = c_rbtree_find_entry(&launcher->services_by_name,
+                                          service_compare_by_name,
+                                          filename,
+                                          Service,
+                                          rb_by_name);
+                if (seen && seen->reload_tag && seen->canonical_path &&
+                    strcmp(canonical_path, seen->canonical_path) == 0)
+                        return 0;
+        }
+
+        r = launcher_ini_reader_parse_file(launcher, &group, path, canonical_path);
         if (r)
                 return error_trace(r);
 
@@ -739,6 +760,8 @@ static int launcher_load_service_file(Launcher *launcher, const char *path, cons
                 if (r)
                         return error_trace(r);
 
+                service->canonical_path = canonical_path;
+                canonical_path = NULL;
                 service->reload_tag = true;
         } else {
                 Service *old_service = c_container_of(parent, Service, rb_by_name);
@@ -748,6 +771,9 @@ static int launcher_load_service_file(Launcher *launcher, const char *path, cons
                         r = service_update(old_service, path, unit, argc, argv, user, uid);
                         if (r)
                                 return error_trace(r);
+                        free(old_service->canonical_path);
+                        old_service->canonical_path = canonical_path;
+                        canonical_path = NULL;
                 } else {
                         log_append_here(&launcher->log, LOG_ERR, 0, DBUS_BROKER_CATALOG_SERVICE_INVALID);
                         log_append_service_path(&launcher->log, path);
